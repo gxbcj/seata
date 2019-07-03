@@ -24,7 +24,6 @@ import io.seata.core.protocol.transaction.BranchRollbackResponse;
 import io.seata.core.rpc.ClientMessageListener;
 import io.seata.core.rpc.ClientMessageSender;
 import io.seata.core.rpc.TransactionMessageHandler;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -94,7 +93,10 @@ public class RmMessageListener implements ClientMessageListener {
             resultMessage = (BranchCommitResponse)handler.onRequest(branchCommitRequest, null);
             sender.sendResponse(msgId, serverAddress, resultMessage);
         } catch (Exception e) {
-            LOGGER.error(FrameworkErrorCode.NetOnMessage.errCode, e.getMessage(), e);
+            LOGGER.error(FrameworkErrorCode.NetOnMessage.getErrCode(), e.getMessage(), e);
+            if (resultMessage == null) {
+                resultMessage = new BranchCommitResponse();
+            }
             resultMessage.setResultCode(ResultCode.Failed);
             resultMessage.setMsg(e.getMessage());
             sender.sendResponse(msgId, serverAddress, resultMessage);
