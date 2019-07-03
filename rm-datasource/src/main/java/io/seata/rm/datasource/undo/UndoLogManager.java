@@ -1,5 +1,5 @@
 /*
- *  Copyright 1999-2018 Alibaba Group Holding Ltd.
+ *  Copyright 1999-2019 Seata.io Group.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -13,8 +13,20 @@
  *  See the License for the specific language governing permissions and
  *  limitations under the License.
  */
-
 package io.seata.rm.datasource.undo;
+
+import com.alibaba.druid.util.JdbcConstants;
+import io.seata.common.Constants;
+import io.seata.common.exception.NotSupportYetException;
+import io.seata.common.util.BlobUtils;
+import io.seata.core.exception.TransactionException;
+import io.seata.rm.datasource.ConnectionContext;
+import io.seata.rm.datasource.ConnectionProxy;
+import io.seata.rm.datasource.DataSourceProxy;
+import io.seata.rm.datasource.sql.struct.TableMeta;
+import io.seata.rm.datasource.sql.struct.TableMetaCache;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.sql.Blob;
 import java.sql.Connection;
@@ -22,20 +34,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLIntegrityConstraintViolationException;
-
-import com.alibaba.druid.util.JdbcConstants;
-import io.seata.common.exception.NotSupportYetException;
-import io.seata.common.util.BlobUtils;
-import io.seata.common.util.StringUtils;
-import io.seata.core.exception.TransactionException;
-import io.seata.rm.datasource.ConnectionContext;
-import io.seata.rm.datasource.ConnectionProxy;
-import io.seata.rm.datasource.DataSourceProxy;
-import io.seata.rm.datasource.sql.struct.TableMeta;
-import io.seata.rm.datasource.sql.struct.TableMetaCache;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.Set;
 
 import static io.seata.core.exception.TransactionExceptionCode.BranchRollbackFailed_Retriable;
 
@@ -45,6 +44,7 @@ import static io.seata.core.exception.TransactionExceptionCode.BranchRollbackFai
  * @author sharajava
  */
 public final class UndoLogManager {
+
     private enum State {
         /**
          * This state can be properly rolled back by services
@@ -74,6 +74,7 @@ public final class UndoLogManager {
     private static String INSERT_UNDO_LOG_SQL = "INSERT INTO " + UNDO_LOG_TABLE_NAME + "\n" +
         "\t(branch_id, xid, rollback_info, log_status, log_created, log_modified)\n" +
         "VALUES (?, ?, ?, ?, now(), now())";
+
     private static String DELETE_UNDO_LOG_SQL = "DELETE FROM " + UNDO_LOG_TABLE_NAME + "\n" +
         "\tWHERE branch_id = ? AND xid = ?";
 
@@ -102,10 +103,10 @@ public final class UndoLogManager {
         branchUndoLog.setBranchId(branchID);
         branchUndoLog.setSqlUndoLogs(connectionContext.getUndoItems());
 
-        String undoLogContent = UndoLogParserFactory.getInstance().encode(branchUndoLog);
+        byte[] undoLogContent = UndoLogParserFactory.getInstance().encode(branchUndoLog);
 
         if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("Flushing UNDO LOG: " + undoLogContent);
+            LOGGER.debug("Flushing UNDO LOG: {}",new String(undoLogContent, Constants.DEFAULT_CHARSET));
         }
 
         insertUndoLogWithNormal(xid, branchID, undoLogContent, cp.getTargetConnection());
@@ -154,13 +155,15 @@ public final class UndoLogManager {
                     // ensuring that only the undo_log in the normal state is processed.
                     int state = rs.getInt("log_status");
                     if (!canUndo(state)) {
-                        LOGGER.info("xid {} branch {}, ignore {} undo_log",
-                            xid, branchId, state);
+                        if (LOGGER.isInfoEnabled()) {
+                            LOGGER.info("xid {} branch {}, ignore {} undo_log",
+                                    xid, branchId, state);
+                        }
                         return;
                     }
 
                     Blob b = rs.getBlob("rollback_info");
-                    String rollbackInfo = StringUtils.blob2string(b);
+                    byte[] rollbackInfo = BlobUtils.blob2Bytes(b);
                     BranchUndoLog branchUndoLog = UndoLogParserFactory.getInstance().decode(rollbackInfo);
 
                     for (SQLUndoLog sqlUndoLog : branchUndoLog.getSqlUndoLogs()) {
@@ -185,20 +188,26 @@ public final class UndoLogManager {
                 if (exists) {
                     deleteUndoLog(xid, branchId, conn);
                     conn.commit();
-                    LOGGER.info("xid {} branch {}, undo_log deleted with {}",
-                        xid, branchId, State.GlobalFinished.name());
+                    if (LOGGER.isInfoEnabled()) {
+                        LOGGER.info("xid {} branch {}, undo_log deleted with {}",
+                                xid, branchId, State.GlobalFinished.name());
+                    }
                 } else {
                     insertUndoLogWithGlobalFinished(xid, branchId, conn);
                     conn.commit();
-                    LOGGER.info("xid {} branch {}, undo_log added with {}",
-                        xid, branchId, State.GlobalFinished.name());
+                    if (LOGGER.isInfoEnabled()) {
+                        LOGGER.info("xid {} branch {}, undo_log added with {}",
+                                xid, branchId, State.GlobalFinished.name());
+                    }
                 }
 
                 return;
             } catch (SQLIntegrityConstraintViolationException e) {
                 // Possible undo_log has been inserted into the database by other processes, retrying rollback undo_log
-                LOGGER.info("xid {} branch {}, undo_log inserted, retry rollback",
-                    xid, branchId);
+                if (LOGGER.isInfoEnabled()) {
+                    LOGGER.info("xid {} branch {}, undo_log inserted, retry rollback",
+                            xid, branchId);
+                }
             } catch (Throwable e) {
                 if (conn != null) {
                     try {
@@ -229,6 +238,66 @@ public final class UndoLogManager {
     }
 
     /**
+     * batch Delete undo log.
+     *
+     * @param xids
+     * @param branchIds
+     * @param conn
+     */
+    public static void batchDeleteUndoLog(Set<String> xids, Set<Long> branchIds, Connection conn) throws SQLException {
+        int xidSize = xids.size();
+        int branchIdSize = branchIds.size();
+        String batchDeleteSql = toBatchDeleteUndoLogSql(xidSize, branchIdSize);
+        PreparedStatement deletePST = null;
+        try {
+            deletePST = conn.prepareStatement(batchDeleteSql);
+            int paramsIndex = 1;
+            for (Long branchId : branchIds) {
+                deletePST.setLong(paramsIndex++, branchId);
+            }
+            for (String xid : xids) {
+                deletePST.setString(paramsIndex++, xid);
+            }
+            int deleteRows = deletePST.executeUpdate();
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("batch delete undo log size " + deleteRows);
+            }
+        } catch (Exception e) {
+            if (!(e instanceof SQLException)) {
+                e = new SQLException(e);
+            }
+            throw (SQLException) e;
+        } finally {
+            if (deletePST != null) {
+                deletePST.close();
+            }
+        }
+
+    }
+
+    protected static String toBatchDeleteUndoLogSql(int xidSize, int branchIdSize) {
+        StringBuilder sqlBuilder = new StringBuilder(64);
+        sqlBuilder.append("DELETE FROM ")
+                .append(UNDO_LOG_TABLE_NAME)
+                .append(" WHERE  branch_id IN ");
+        appendInParam(branchIdSize, sqlBuilder);
+        sqlBuilder.append(" AND xid IN ");
+        appendInParam(xidSize, sqlBuilder);
+        return sqlBuilder.toString();
+    }
+
+    protected static void appendInParam(int size, StringBuilder sqlBuilder) {
+        sqlBuilder.append(" (");
+        for (int i = 0;i < size;i++) {
+            sqlBuilder.append("?");
+            if (i < (size - 1)) {
+                sqlBuilder.append(",");
+            }
+        }
+        sqlBuilder.append(") ");
+    }
+
+    /**
      * Delete undo log.
      *
      * @param xid the xid
@@ -237,38 +306,49 @@ public final class UndoLogManager {
      * @throws SQLException the sql exception
      */
     public static void deleteUndoLog(String xid, long branchId, Connection conn) throws SQLException {
-        PreparedStatement deletePST = conn.prepareStatement(DELETE_UNDO_LOG_SQL);
-        deletePST.setLong(1, branchId);
-        deletePST.setString(2, xid);
-        deletePST.executeUpdate();
+        PreparedStatement deletePST = null;
+        try {
+            deletePST = conn.prepareStatement(DELETE_UNDO_LOG_SQL);
+            deletePST.setLong(1, branchId);
+            deletePST.setString(2, xid);
+            deletePST.executeUpdate();
+        } catch (Exception e) {
+            if (!(e instanceof SQLException)) {
+                e = new SQLException(e);
+            }
+            throw (SQLException) e;
+        } finally {
+            if (deletePST != null) {
+                deletePST.close();
+            }
+        }
     }
 
     private static void insertUndoLogWithNormal(String xid, long branchID,
-                                                String undoLogContent, Connection conn) throws SQLException {
+                                                byte[] undoLogContent, Connection conn) throws SQLException {
         insertUndoLog(xid, branchID, undoLogContent, State.Normal, conn);
     }
 
     private static void insertUndoLogWithGlobalFinished(String xid, long branchID,
                                                         Connection conn) throws SQLException {
-        insertUndoLog(xid, branchID, "{}", State.GlobalFinished, conn);
+        insertUndoLog(xid, branchID, "{}".getBytes(Constants.DEFAULT_CHARSET), State.GlobalFinished, conn);
     }
 
     private static void insertUndoLog(String xid, long branchID,
-                                      String undoLogContent, State state, Connection conn) throws SQLException {
+                                      byte[] undoLogContent, State state, Connection conn) throws SQLException {
         PreparedStatement pst = null;
         try {
             pst = conn.prepareStatement(INSERT_UNDO_LOG_SQL);
             pst.setLong(1, branchID);
             pst.setString(2, xid);
-            pst.setBlob(3, BlobUtils.string2blob(undoLogContent));
+            pst.setBlob(3, BlobUtils.bytes2Blob(undoLogContent));
             pst.setInt(4, state.getValue());
             pst.executeUpdate();
         } catch (Exception e) {
-            if (e instanceof SQLException) {
-                throw (SQLException)e;
-            } else {
-                throw new SQLException(e);
+            if (!(e instanceof SQLException)) {
+                e = new SQLException(e);
             }
+            throw (SQLException) e;
         } finally {
             if (pst != null) {
                 pst.close();
